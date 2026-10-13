@@ -1,0 +1,11 @@
+# Source-only release: binaries, credentials, local state, archives, patches,
+# verification output, and other generated files are excluded by default.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/plugin.toml
+!/host.luau
+!/window.luau
+!/panel.css
+!/helper.mjs
