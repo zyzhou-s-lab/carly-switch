@@ -5,10 +5,15 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { YAML } from 'bun';
+import { fileURLToPath } from 'node:url';
+import { readBuild, runtimeManager } from './runtime-build.mjs';
 
 // No key contents, child output, server payloads, or raw exceptions are logged.
 const HOME = homedir();
-let CUSTOM = join(HOME, '.local', 'share', 'carly-switch', 'omp');
+const DEFAULT_RUNTIME = join(HOME, '.local', 'share', 'carly-switch', 'omp');
+let CUSTOM = DEFAULT_RUNTIME;
+let CONFIG_RUNTIME;
+const canAutoBuild = process.env.CARLY_SWITCH_OMP === undefined;
 const ENTRY = join(HOME, '.local', 'bin', 'omp');
 const CONFIG = join(HOME, '.omp', 'agent');
 const DATA = join(HOME, 'Library', 'Application Support', 'Tern', 'plugin-data', 'carly-switch');
@@ -18,11 +23,14 @@ const DEFAULT_VOICE = 'zh_female_vv_jupiter_bigtts';
 const MAX_KEY_BYTES = 16 * 1024;
 // Provider is written last, including during rollback and restore.
 const KEYS = ['live.doubao.apiKeyFile', 'live.doubao.voice', 'live.provider'];
-const RUNTIME_HELP = 'Compatible OMP runtime missing or not executable. Set CARLY_SWITCH_OMP to an absolute or ~/ path, or install your compatible runtime at ~/.local/share/carly-switch/omp. This source-only plugin does not include or download a runtime; stock OMP does not gain Doubao support by installing the plugin.';
+const RUNTIME_HELP = canAutoBuild
+  ? 'The first Save/apply builds the pinned compatible OMP v18.10.3 runtime. Opening this panel does not build or change files.'
+  : 'The explicitly selected CARLY_SWITCH_OMP runtime is missing or not executable. Supply a compatible runtime; explicit overrides are never built or overwritten.';
 const HELP = `Carly Switch (macOS only; default ~/.omp/agent global configuration)
-Usage: bun helper.mjs status|switch|restore|check [--provider codex|doubao] [--key-stdin] [--voice VOICE_ID]
-Runtime: CARLY_SWITCH_OMP must be an absolute or ~/ path; the default is ~/.local/share/carly-switch/omp. Supply a compatible executable exposing live.provider (codex|doubao), live.doubao.apiKeyFile, live.doubao.voice, and native live RPC. No runtime is bundled, downloaded, built, or patched. Stock OMP does not gain Doubao support by installing this plugin.
+Usage: bun helper.mjs status|build-status|switch|restore|check [--provider codex|doubao] [--key-stdin] [--voice VOICE_ID]
+Runtime: first Save/apply builds pinned OMP v18.10.3 with the shipped patch at ~/.local/share/carly-switch/omp. Official Tern OMP must be exactly v18.10.3. Requires Bun >=1.4, Git and codesign; a cold native build also requires Cargo/Rustup, CMake and Xcode Command Line Tools. CARLY_SWITCH_OMP is a manual compatible-runtime override and is never overwritten.
 status: read-only; does not execute OMP or read key contents.
+build-status: read-only progress metadata; never executes OMP. Private logs contain only controlled stage and command-exit summaries, not raw child output.
 switch --provider doubao: save and apply Doubao voice settings; first takeover backs up the original entry and three live fields.
 switch --provider codex: use the compatible runtime's OpenAI voice implementation; Doubao key and voice arguments are rejected. This does not restore the original executable.
 --key-stdin: for Doubao switch/check only; read one UTF-8 API key directly from stdin (maximum 16 KiB). Never put keys in command arguments, environment variables, or public files. Empty or invalid input is rejected.
@@ -77,7 +85,7 @@ function options() {
     if (args.length) fail('--help does not accept additional arguments.');
     return { action: 'help' };
   }
-  if (!['status', 'switch', 'restore', 'check'].includes(action)) fail('Unknown action; see --help.');
+  if (!['status', 'build-status', 'switch', 'restore', 'check'].includes(action)) fail('Unknown action; see --help.');
   const result = { action };
   const names = { '--provider': 'provider', '--voice': 'voice' };
   while (args.length) {
@@ -94,7 +102,7 @@ function options() {
   }
   if (result.provider !== undefined && !['codex', 'doubao'].includes(result.provider)) fail('Provider must be codex or doubao.');
   if (action === 'switch' && result.provider === undefined) fail('Switch requires an explicit --provider codex or doubao.');
-  if (['status', 'restore'].includes(action) && Object.keys(result).length !== 1) fail('status and restore do not accept settings arguments.');
+  if (['status', 'build-status', 'restore'].includes(action) && Object.keys(result).length !== 1) fail('status, build-status and restore do not accept settings arguments.');
   if (action === 'check' && result.provider === 'codex') fail('check tests only the Doubao connection, not OpenAI.');
   if (result.provider === 'codex' && (result.keyStdin || result.voice !== undefined)) fail('OpenAI does not accept Doubao key or voice arguments.');
   if (result.voice !== undefined && !/^[A-Za-z0-9_][A-Za-z0-9_-]{0,159}$/u.test(result.voice)) fail('Voice IDs must contain 1-160 letters, digits, underscores, or hyphens and cannot begin with a hyphen.');
@@ -219,7 +227,7 @@ async function snapshot(action) {
     if (error) error = `${error} ${RUNTIME_HELP}`;
     else message = `${message} ${RUNTIME_HELP}`;
   }
-  return { ok: !error, action, provider, installed, customBinaryExists, keyFile, voice,
+  return { ok: !error, action, provider, installed, customBinaryExists, canAutoBuild, build: await readBuild(DATA), keyFile, voice,
     hasKeyFile: await keyExists(keyFile), entry: ENTRY, originalTarget: state?.originalTarget ?? null,
     restartRequired: installed || !!state?.pending, message: error ?? message, ...(error ? { error } : {}) };
 }
@@ -285,6 +293,7 @@ async function officialTarget(target) {
   const versions = join(HOME, 'Library', 'Application Support', 'Tern', 'omp', 'versions');
   const [canonical, base] = await Promise.all([realpath(candidate), realpath(versions)]).catch(() => fail('Cannot read the original OMP entry target or safely back it up.'));
   if (!canonical.startsWith(`${base}/`) || !await executable(candidate)) fail('The OMP entry is not a Tern-managed official version; unknown third-party entries will not be taken over.');
+  return canonical;
 }
 async function configCommand(args) {
   // ':' is truthy (blocks .env fallback), but yields zero config overlays
@@ -292,7 +301,7 @@ async function configCommand(args) {
   const env = { ...process.env, PI_CODING_AGENT_DIR: CONFIG, OMP_CODING_AGENT_DIR: CONFIG,
     PI_PROFILE: 'default', OMP_PROFILE: 'default', PI_CONFIG_FILES: ':', OMP_CONFIG_FILES: ':', NO_COLOR: '1' };
   let child;
-  try { child = Bun.spawn([CUSTOM, 'config', ...args, '--json'], { cwd: '/', env, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' }); }
+  try { child = Bun.spawn([CONFIG_RUNTIME ?? CUSTOM, 'config', ...args, '--json'], { cwd: '/', env, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' }); }
   catch { fail('Cannot start the compatible OMP configuration command.'); }
   const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
   try {
@@ -338,71 +347,122 @@ async function rollback(state) {
   return clean;
 }
 async function mutate(opts, inputKey) {
-  if (!await executable(CUSTOM)) fail(`${RUNTIME_HELP} The entry has not been changed.`);
+  if (!canAutoBuild && !await executable(CUSTOM)) fail(`${RUNTIME_HELP} The entry has not been changed.`);
   return withLock(async () => {
-    let state = await loadState();
-    if (state?.pending) state = await rollback(state);
-    const before = await fields();
-    const link = await entryInfo();
-    if (link.kind !== 'link') fail('Only existing OMP symlinks can be replaced; regular files and missing entries are left unchanged.');
-    if (state) {
-      await requireEntry(CUSTOM);
-      await assertFields(state.managedFields);
-    } else if (opts.action === 'restore') {
-      fail('No plugin backup exists; no personal configuration or entry was changed.');
-    } else {
-      await officialTarget(link.target);
-    }
-    if (opts.action === 'restore') await officialTarget(state.originalTarget);
-    const first = !state;
-    const status = await snapshot(opts.action);
-    const newKeyFile = inputKey === undefined ? undefined : join(DATA, `key-${randomUUID()}`);
-    const next = opts.action === 'restore' ? state.originalFields : {
-      ...before,
-      'live.provider': { present: true, value: opts.provider },
-    };
-    if (opts.action === 'switch' && opts.provider === 'doubao') {
-      next['live.doubao.apiKeyFile'] = { present: true, value: newKeyFile ?? status.keyFile };
-      next['live.doubao.voice'] = { present: true, value: opts.voice ?? status.voice };
-      if (!newKeyFile && !await keyExists(status.keyFile)) fail('Enter an API key; no readable existing key file is configured.');
-    }
-    await requireEntry(link.target);
-    state ??= { version: 1, entry: ENTRY, custom: CUSTOM, configDir: CONFIG,
-      originalTarget: link.target, originalFields: before, managedFields: before, pending: null };
-    const target = opts.action === 'restore' ? state.originalTarget : CUSTOM;
-    state = { ...state, pending: { first, beforeFields: before, afterFields: next, beforeTarget: link.target, afterTarget: target,
-      ...(newKeyFile ? { newKeyFile } : {}) } };
-    let keyCreated = false;
-    let journalWritten = false;
+    const builder = runtimeManager({ home: HOME, data: DATA, runtime: DEFAULT_RUNTIME,
+      patch: fileURLToPath(new URL('./patches/omp-native-doubao.patch', import.meta.url)), fail });
+    let response;
     try {
-      // Never replace an existing credential: journal only its new private path.
-      if (newKeyFile) {
-        await savePrivateKey(newKeyFile, inputKey);
-        keyCreated = true;
-        inputKey = undefined;
+      let state = await loadState();
+      let link = await entryInfo();
+      if (link.kind !== 'link') fail('Only existing OMP symlinks can be replaced; regular files and missing entries are left unchanged.');
+      if (opts.action === 'switch') {
+        const original = await officialTarget(state?.originalTarget ?? link.target);
+        await builder.validateOfficial(original);
       }
-      await saveState(state);
-      journalWritten = true;
-      // Even path initializes omp storage; journal before invoking any CLI.
-      if (await configCommand(['path']) !== CONFIG) fail('The native OMP configuration directory does not match the backup; stopped.');
-      await assertFields(before);
-      await applyFields(before, next, link.target);
-      await replaceEntry(link.target, target);
-      if (opts.action === 'restore') await unlink(STATE);
-      else await saveState({ ...state, managedFields: next, pending: null });
-    } catch (error) {
+      const recovery = canAutoBuild ? await builder.pending(state?.runtimeBuild) : null;
+      const recoveringFirst = opts.action === 'restore' && state?.pending?.first;
+      CONFIG_RUNTIME = recovery?.path ?? CUSTOM;
+      if (state?.pending) state = await rollback(state);
+      if (recovery) {
+        if (state?.runtimeBuild === recovery.id) await recovery.finalize();
+        else await recovery.rollback();
+      }
+      CONFIG_RUNTIME = CUSTOM;
+      if (recoveringFirst) {
+        const result = await snapshot(opts.action);
+        result.restartRequired = true;
+        result.message = 'The interrupted first activation was rolled back. The original OMP entry and live settings are restored.';
+        response = result;
+        return response;
+      }
+      const before = await fields();
+      link = await entryInfo();
+      if (link.kind !== 'link') fail('The OMP entry changed; refusing changes.');
+      if (state) {
+        await requireEntry(CUSTOM);
+        await assertFields(state.managedFields);
+      } else if (opts.action === 'restore') {
+        fail('No plugin backup exists; no personal configuration or entry was changed.');
+      } else {
+        await officialTarget(link.target);
+      }
+      if (opts.action === 'restore') {
+        await officialTarget(state.originalTarget);
+        if (!await executable(CUSTOM)) fail('The compatible runtime required to restore the saved live fields is missing. Restore it before retrying; the original entry was not changed.');
+      }
+      const first = !state;
+      const status = await snapshot(opts.action);
+      const newKeyFile = inputKey === undefined ? undefined : join(DATA, `key-${randomUUID()}`);
+      const next = opts.action === 'restore' ? state.originalFields : {
+        ...before, 'live.provider': { present: true, value: opts.provider },
+      };
+      if (opts.action === 'switch' && opts.provider === 'doubao') {
+        next['live.doubao.apiKeyFile'] = { present: true, value: newKeyFile ?? status.keyFile };
+        next['live.doubao.voice'] = { present: true, value: opts.voice ?? status.voice };
+        if (!newKeyFile && !await keyExists(status.keyFile)) fail('Enter an API key; no readable existing key file is configured.');
+      }
+      await requireEntry(link.target);
+      const runtime = opts.action === 'switch' && canAutoBuild ? await builder.prepare() : null;
+      CONFIG_RUNTIME = runtime?.path ?? CUSTOM;
+      state ??= { version: 1, entry: ENTRY, custom: CUSTOM, configDir: CONFIG,
+        originalTarget: link.target, originalFields: before, managedFields: before, pending: null };
+      const target = opts.action === 'restore' ? state.originalTarget : CUSTOM;
+      state = { ...state, pending: { first, beforeFields: before, afterFields: next, beforeTarget: link.target, afterTarget: target,
+        ...(newKeyFile ? { newKeyFile } : {}) } };
+      let keyCreated = false;
+      let journalWritten = false;
       try {
-        if (journalWritten) await rollback(state);
-        else if (keyCreated) await unlink(newKeyFile);
-      } catch { fail('The operation failed and could not be fully rolled back safely. Minimal backup and transaction records were retained. Do not overwrite the entry or configuration; resolve conflicts and run restore.'); }
-      fail(`${error instanceof SafeError ? error.message : 'Operation failed.'} These changes were rolled back; the original key was not modified.`);
+        await requireEntry(link.target);
+        await assertFields(before);
+        // A tested candidate is ready before any credentials or settings are written.
+        if (newKeyFile) {
+          await savePrivateKey(newKeyFile, inputKey);
+          keyCreated = true;
+          inputKey = undefined;
+        }
+        await saveState(state);
+        journalWritten = true;
+        if (await configCommand(['path']) !== CONFIG) fail('The native OMP configuration directory does not match the backup; stopped.');
+        await assertFields(before);
+        await runtime?.install();
+        await applyFields(before, next, link.target);
+        await replaceEntry(link.target, target);
+        if (opts.action === 'restore') await unlink(STATE);
+        else await saveState({ ...state, managedFields: next, pending: null,
+          ...(runtime?.id ? { runtimeBuild: runtime.id } : {}) });
+        // Commit point: settings/entry are applied and the clean backup is durable.
+        // Runtime finalization below is housekeeping, not a rollback boundary.
+      } catch (error) {
+        try {
+          // Keep the staged candidate usable until configuration rollback completes.
+          if (journalWritten) await rollback(state);
+          else if (keyCreated) await unlink(newKeyFile);
+          await runtime?.rollback();
+        } catch { fail('The operation failed and could not be fully rolled back safely. Backup, candidate, and transaction records were retained. Do not overwrite the entry, runtime, or configuration; resolve conflicts and run restore.'); }
+        fail(`${error instanceof SafeError ? error.message : 'Operation failed.'} These changes were rolled back; the original key was not modified.`);
+      }
+      await runtime?.finalize();
+      if (!runtime) await builder.complete();
+      const result = await snapshot(opts.action);
+      result.restartRequired = first || opts.action === 'restore';
+      result.message = opts.action === 'restore'
+        ? 'Original OMP restored. Restart Tern to apply; the current call is unaffected.'
+        : `${opts.provider === 'doubao' ? 'Doubao' : 'OpenAI'} saved. ${first ? 'Restart Tern to apply; the current call is unaffected.' : 'Changes apply when voice is next started.'}`;
+      response = result;
+      return response;
+    } catch (error) {
+      await builder.failed();
+      throw error;
+    } finally {
+      CONFIG_RUNTIME = CUSTOM;
+      await builder.close();
+      const warning = builder.warnings().join(' ');
+      if (response && warning) {
+        response.warning = warning;
+        response.message = `${response.message} Warning: ${warning}`;
+      }
     }
-    const result = await snapshot(opts.action);
-    result.restartRequired = first || opts.action === 'restore';
-    result.message = opts.action === 'restore'
-      ? 'Original OMP restored. Restart Tern to apply; the current call is unaffected.'
-      : `${opts.provider === 'doubao' ? 'Doubao' : 'OpenAI'} saved. ${first ? 'Restart Tern to apply; the current call is unaffected.' : 'Changes apply when voice is next started.'}`;
-    return result;
   });
 }
 
@@ -466,7 +526,7 @@ async function checkConnection(keyFile, voice, inputKey) {
   });
 }
 
-let action = ['status', 'switch', 'restore', 'check', '--help', '-h'].includes(process.argv[2]) ? process.argv[2] : 'status';
+let action = ['status', 'build-status', 'switch', 'restore', 'check', '--help', '-h'].includes(process.argv[2]) ? process.argv[2] : 'status';
 let result;
 try {
   const opts = options();
@@ -474,10 +534,10 @@ try {
   CUSTOM = runtimePath();
   assertScope();
   let inputKey = opts.keyStdin ? await readStdinKey() : undefined;
-  if (action === 'help') {
-    result = { ok: true, action, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM),
+  if (action === 'help' || action === 'build-status') {
+    result = { ok: true, action, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM), canAutoBuild, build: await readBuild(DATA),
       keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
-      originalTarget: null, restartRequired: false, message: HELP };
+      originalTarget: null, restartRequired: false, message: action === 'help' ? HELP : 'Runtime build progress retrieved.' };
   } else if (action === 'switch' || action === 'restore') result = await mutate(opts, inputKey);
   else {
     result = await snapshot(action);
@@ -492,7 +552,7 @@ try {
 } catch (error) {
   const message = error instanceof SafeError ? error.message : 'Operation failed; underlying exceptions and service responses are withheld to protect privacy.';
   try { result = await snapshot(action); } catch {}
-  result = { ok: false, action, provider: 'codex', installed: false, customBinaryExists: false,
+  result = { ok: false, action, provider: 'codex', installed: false, customBinaryExists: false, canAutoBuild, build: await readBuild(DATA),
     keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
     originalTarget: null, restartRequired: false, ...result, ok: false, action, message, error: message };
 }

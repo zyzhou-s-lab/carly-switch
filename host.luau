@@ -10,6 +10,14 @@ local VOICES = {
 	{ id = "zh_male_xiaotian_jupiter_bigtts", label = "Xiaotian · Male" },
 }
 
+type Build = {
+	state: string,
+	stage: string,
+	elapsedSeconds: number,
+	logPath: string,
+	message: string,
+}
+
 type State = {
 	status: any,
 	busy: string,
@@ -26,6 +34,11 @@ type State = {
 	focus: string,
 	cursor: number,
 	anchor: number?,
+	build: Build?,
+	requestId: number,
+	pollTimer: TimerHandle?,
+	pollInFlight: number?,
+	disposed: boolean,
 }
 
 local function text(value: any): string
@@ -127,8 +140,78 @@ local function bun_path(): string
 	return "bun"
 end
 
+local polling: { [number]: State } = {}
+
+local function valid_build(value: any): boolean
+	return value == nil or value == tern.json.null or (type(value) == "table"
+		and type(value.state) == "string" and type(value.stage) == "string"
+		and type(value.elapsedSeconds) == "number" and value.elapsedSeconds >= 0
+		and value.elapsedSeconds < math.huge
+		and type(value.logPath) == "string" and type(value.message) == "string")
+end
+
+local function stop_polling(state: State, cx: BlockCx)
+	if state.pollTimer then state.pollTimer:cancel(); state.pollTimer = nil end
+	if polling[cx.pane] == state then polling[cx.pane] = nil end
+end
+
+local function poll_build(state: State, cx: BlockCx, requestId: number, bun: string)
+	if state.disposed or state.requestId ~= requestId or state.busy ~= "switch" then return end
+	if not alive(cx) then
+		state.disposed = true
+		stop_polling(state, cx)
+		return
+	end
+	state.pollTimer = tern.timer(1000, function()
+		state.pollTimer = nil
+		if state.disposed or state.requestId ~= requestId or state.busy ~= "switch" then return end
+		if not alive(cx) then
+			state.disposed = true
+			stop_polling(state, cx)
+			return
+		end
+		-- A previous request's late poll may still be exiting. Never overlap polls.
+		if state.pollInFlight ~= nil then poll_build(state, cx, requestId, bun); return end
+		state.pollInFlight = requestId
+		local ok = pcall(function()
+			tern.process.run({ bun, tern.plugin.dir .. "/helper.mjs", "build-status" }, {
+				cwd = "/", timeout_ms = 5000,
+			}, function(result)
+				if state.pollInFlight == requestId then state.pollInFlight = nil end
+				if state.disposed or state.requestId ~= requestId or state.busy ~= "switch" then return end
+				if not alive(cx) then
+					state.disposed = true
+					stop_polling(state, cx)
+					return
+				end
+				local decoded, reply = pcall(tern.json.decode, result.stdout)
+				if result.status == 0 and decoded and type(reply) == "table"
+					and reply.action == "build-status" and reply.ok == true and valid_build(reply.build) then
+					-- Progress never replaces provider status, drafts, or transaction errors.
+					state.build = if type(reply.build) == "table" then reply.build else nil
+					cx:render()
+				end
+				poll_build(state, cx, requestId, bun)
+			end)
+		end)
+		if not ok then
+			state.pollInFlight = nil
+			poll_build(state, cx, requestId, bun)
+		end
+	end)
+end
+
+tern.on("pane_exited", function(ev)
+	local state = polling[ev.pane]
+	if not state then return end
+	state.disposed = true
+	state.requestId += 1
+	if state.pollTimer then state.pollTimer:cancel(); state.pollTimer = nil end
+	polling[ev.pane] = nil
+end)
+
 local function request(state: State, cx: BlockCx, action: string, provider: string?)
-	if state.busy ~= "" then return end
+	if state.disposed or state.busy ~= "" then return end
 	state.confirm, state.error, state.message, state.menu = "", "", "", false
 	focus(state, cx, "")
 	if tern.runtime.os ~= "macos" then
@@ -136,8 +219,12 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 		return
 	end
 	state.busy = action
+	state.requestId += 1
+	local requestId = state.requestId
+	if action == "switch" then state.build = nil end
 	local ok = pcall(function()
-		local argv = { bun_path(), tern.plugin.dir .. "/helper.mjs", action }
+		local bun = bun_path()
+		local argv = { bun, tern.plugin.dir .. "/helper.mjs", action }
 		if provider then table.insert(argv, "--provider"); table.insert(argv, provider) end
 		local doubao = action == "check" or (action == "switch" and provider == "doubao")
 		if doubao then
@@ -150,13 +237,16 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 			stdin = if doubao and state.apiKey ~= "" then state.apiKey else nil,
 			timeout_ms = if action == "status" or action == "check" then 60000 else nil,
 		}, function(result)
-			if not alive(cx) then return end
+			if state.disposed or state.requestId ~= requestId then return end
+			stop_polling(state, cx)
+			if not alive(cx) then state.disposed = true; return end
 			state.busy = ""
 			local decoded, reply = pcall(tern.json.decode, result.stdout)
 			if not decoded or type(reply) ~= "table" or reply == tern.json.null
 				or type(reply.ok) ~= "boolean" or reply.action ~= action
 				or (reply.provider ~= "codex" and reply.provider ~= "doubao")
 				or type(reply.installed) ~= "boolean" or type(reply.customBinaryExists) ~= "boolean"
+				or type(reply.canAutoBuild) ~= "boolean" or not valid_build(reply.build)
 				or type(reply.hasKeyFile) ~= "boolean" or type(reply.restartRequired) ~= "boolean"
 				or type(reply.keyFile) ~= "string" or type(reply.voice) ~= "string"
 				or type(reply.entry) ~= "string" or type(reply.message) ~= "string" then
@@ -165,6 +255,7 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 				-- Unexpected stdout/stderr must never be echoed: it may contain secrets.
 			else
 				state.status = reply
+				state.build = if type(reply.build) == "table" then reply.build else nil
 				local success = reply.ok and result.status == 0
 				if not state.initialized or (success and (action == "switch" or action == "restore")) then
 					state.provider, state.voice = reply.provider, reply.voice
@@ -184,8 +275,13 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 			end
 			cx:render()
 		end)
+		if action == "switch" then
+			polling[cx.pane] = state
+			poll_build(state, cx, requestId, bun)
+		end
 	end)
 	if not ok then
+		stop_polling(state, cx)
 		state.busy, state.status = "", nil
 		state.error = "Unable to start the helper. Check Bun and the plugin, then refresh."
 	end
@@ -225,12 +321,14 @@ end
 
 local function confirmation(state: State): Node
 	local restore = state.confirm == "restore"
+	local build = not restore and state.status ~= nil and not state.status.customBinaryExists and state.status.canAutoBuild
 	return ui.node("overlay", {
-		key = "confirmation", modal = true, head = if restore then "Restore original runtime?" else "Enable Carly Switch?",
+		key = "confirmation", modal = true, head = if restore then "Restore original runtime?" elseif build then "Build and enable Carly Switch?" else "Enable Carly Switch?",
 	}, {
 		ui.text(if restore then "Restore the original runtime and voice settings. Restart Tern to apply. The current call is unaffected."
+			elseif build then "Download the pinned omp 18.10.3 source, apply the shipped patch, and build a private runtime. This requires network access and build tools; only official omp 18.10.3 is supported. The official binary stays unchanged and the original entry point is backed up before enabling. Restart Tern after first enabling. This does not start the microphone or interrupt the current call."
 			else "Back up the original entry point and enable voice settings. Restart Tern after first enabling. This will not start the microphone or interrupt the current call."),
-		ui.row({ button(if restore then "Restore" else "Enable", "confirm", state.busy == "", "cs-button-primary"),
+		ui.row({ button(if restore then "Restore" elseif build then "Build and enable" else "Enable", "confirm", state.busy == "", "cs-button-primary"),
 			button("Cancel", "cancel", state.busy == "", nil) }),
 	})
 end
@@ -239,6 +337,7 @@ local function view(state: State): BlockView
 	local status = state.status
 	local idle = state.busy == "" and state.confirm == ""
 	local ready = idle and status ~= nil and status.customBinaryExists
+	local saveReady = idle and status ~= nil and (status.customBinaryExists or status.canAutoBuild)
 	local current = if status then (if status.provider == "doubao" then "Current · Doubao" else "Current · OpenAI")
 		elseif state.busy == "status" then "Reading status" else "Status unavailable"
 	local kids: { Node } = {
@@ -267,7 +366,7 @@ local function view(state: State): BlockView
 		table.insert(kids, ui.text(ui.span("Uses your signed-in OpenAI account. No Doubao key is needed.", "muted")))
 	end
 	table.insert(kids, row("actions", {
-		button("Save and apply", "save", ready, "cs-button-primary"),
+		button("Save and apply", "save", saveReady, "cs-button-primary"),
 		button("Test connection", "check", ready and state.provider == "doubao", nil),
 	}))
 	local effect = "Restart Tern after first enabling. Later changes apply to the next call."
@@ -279,7 +378,20 @@ local function view(state: State): BlockView
 		local labels = { status = "Reading status…", switch = "Saving…", check = "Testing connection (no microphone)…", restore = "Restoring…" }
 		table.insert(kids, ui.progress(nil, labels[state.busy] or "Working…"))
 	end
-	if status and not status.customBinaryExists then table.insert(kids, ui.diagnostic({ severity = "error", message = "Compatible runtime unavailable. Set CARLY_SWITCH_OMP to its path or place it at $HOME/.local/share/carly-switch/omp." })) end
+	local build = state.build
+	if build then
+		table.insert(kids, ui.text(ui.span("Runtime setup · " .. build.stage .. " · " .. tostring(math.floor(build.elapsedSeconds)) .. "s", "strong")))
+		if build.message ~= "" then table.insert(kids, ui.text(build.message)) end
+		if build.logPath ~= "" then table.insert(kids, ui.text({ ui.span("Private build log: ", "muted"), ui.path(build.logPath, "/") })) end
+	end
+	if status and not status.customBinaryExists and state.busy ~= "switch" then
+		if status.canAutoBuild then
+			table.insert(kids, ui.diagnostic({ severity = "note", message = "First Save downloads and builds a private omp 18.10.3 runtime with the shipped patch. Network access and build tools are required. Only official omp 18.10.3 is supported; the official binary is preserved." }))
+		else
+			table.insert(kids, ui.diagnostic({ severity = "error", message = "Configured runtime unavailable. CARLY_SWITCH_OMP is a manual override and is never built or overwritten automatically. Supply a compatible runtime at that path, or unset the override to build on first Save." }))
+		end
+	end
+	if status and text(status.warning) ~= "" then table.insert(kids, ui.diagnostic({ severity = "warning", message = status.warning })) end
 	if state.error ~= "" then table.insert(kids, ui.diagnostic({ severity = "error", message = state.error })) end
 	if state.message ~= "" then table.insert(kids, ui.text(state.message)) end
 	table.insert(kids, button(if state.more then "More ▴" else "More ▾", "more", idle, "cs-more"))
@@ -299,9 +411,9 @@ local function focus_order(state: State): { string }
 		table.insert(order, "main.apiKey")
 		table.insert(order, "main.voice")
 	end
-	if state.status and state.status.customBinaryExists then
-		table.insert(order, "main.actions.save")
-		if state.provider == "doubao" then table.insert(order, "main.actions.check") end
+	if state.status then
+		if state.status.customBinaryExists or state.status.canAutoBuild then table.insert(order, "main.actions.save") end
+		if state.status.customBinaryExists and state.provider == "doubao" then table.insert(order, "main.actions.check") end
 	end
 	table.insert(order, "main.more")
 	if state.more then
@@ -317,6 +429,7 @@ local panel: BlockDef<State> = {
 		local state: State = {
 			status = nil, busy = "", error = "", message = "", apiKey = "", provider = "doubao", voice = DEFAULT_VOICE,
 			initialized = false, confirm = "", more = false, menu = false, menuCursor = 1, focus = "", cursor = 0, anchor = nil,
+			build = nil, requestId = 0, pollTimer = nil, pollInFlight = nil, disposed = false,
 		}
 		request(state, cx, "status", nil)
 		return state
@@ -359,8 +472,8 @@ local panel: BlockDef<State> = {
 		elseif action == "refresh" then request(state, cx, "status", nil)
 		elseif action == "check" and state.provider == "doubao" and state.status and state.status.customBinaryExists then
 			request(state, cx, "check", "doubao")
-		elseif action == "save" and state.status and state.status.customBinaryExists then
-			if state.status.installed then request(state, cx, "switch", state.provider)
+		elseif action == "save" and state.status and (state.status.customBinaryExists or state.status.canAutoBuild) then
+			if state.status.installed and state.status.customBinaryExists then request(state, cx, "switch", state.provider)
 			else state.confirm = "apply"; focus(state, cx, "") end
 		elseif action == "restore" and state.status and text(state.status.originalTarget) ~= "" then
 			state.confirm = "restore"

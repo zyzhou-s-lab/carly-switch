@@ -9,6 +9,7 @@
 !/window.luau
 !/panel.css
 !/helper.mjs
+!/runtime-build.mjs
 !/patches/
 /patches/*
 !/patches/omp-native-doubao.patch
