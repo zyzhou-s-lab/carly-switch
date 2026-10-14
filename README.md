@@ -14,7 +14,7 @@ The repository is currently private, so installation requires GitHub access to i
 
 - macOS and Tern with native plugin blocks and process stdin support.
 - Bun 1.4 or newer, available at `~/.bun/bin/bun`, a standard Homebrew location, or on Tern's `PATH`.
-- **A separately supplied compatible OMP executable.** It must support native live voice RPC and these settings:
+- **An OMP executable built with the included [native Doubao patch](patches/omp-native-doubao.patch) for v18.10.3.** Follow the build steps below. The patched runtime supports native live voice RPC and these settings:
   - `live.provider`, with `codex` and `doubao` values
   - `live.doubao.apiKeyFile`
   - `live.doubao.voice`
@@ -23,9 +23,67 @@ The repository is currently private, so installation requires GitHub access to i
 - For Doubao: an API key with access to the end-to-end realtime voice service. A text-model API key is not a substitute.
 - For OpenAI voice: the ChatGPT/Codex sign-in required by the supplied OMP runtime.
 
-Place the compatible executable at `~/.local/share/carly-switch/omp`, or set `CARLY_SWITCH_OMP` to its absolute path or a `~/` path before starting Tern. The variable must be available to the process running the plugin; exporting it only inside an already-running terminal pane is not sufficient. The default path avoids that environment setup.
+## Build patched OMP (v18.10.3)
 
-**This is a source-only plugin.** It does not bundle, download, build, or patch OMP. Installing it does not add Doubao support to a stock OMP executable. Supply the compatible runtime before applying a backend change.
+This repository includes `patches/omp-native-doubao.patch`, targeting [OMP v18.10.3](https://github.com/can1357/oh-my-pi/tree/v18.10.3), commit `81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b`. Do not assume that it applies to other releases. The patch adds the Doubao transport while retaining Carly's native live RPC interface and the OpenAI voice implementation.
+
+**Only the source patch is included, not a compiled OMP binary or a source tarball.** Installing the Tern plugin alone is not sufficient: apply the patch and build the runtime before enabling it. The plugin does not perform these build steps automatically.
+
+### Get the source and apply the patch
+
+The example uses sibling `carly-switch` and `omp-v18.10.3` checkouts. If you already have this repository, use its existing path instead of cloning it again.
+
+```sh
+git clone https://github.com/cangiolo/carly-switch.git
+git clone --branch v18.10.3 --depth 1 https://github.com/can1357/oh-my-pi.git omp-v18.10.3
+cd omp-v18.10.3
+git apply --check ../carly-switch/patches/omp-native-doubao.patch
+git apply ../carly-switch/patches/omp-native-doubao.patch
+```
+
+Stop if the patch check fails; do not force it onto a different checkout or continue with an unpatched build.
+
+### Build the executable
+
+Build on the macOS architecture that will run Tern. In addition to Git and Bun, install the Rust/Cargo and macOS native build prerequisites required by the pinned checkout; see OMP's [v18.10.3 native build runbook](https://github.com/can1357/oh-my-pi/blob/v18.10.3/docs/natives-build-release-debugging.md). Run from the patched OMP checkout root:
+
+```sh
+bun install --frozen-lockfile --ignore-scripts
+bun run build:native
+bun --cwd=packages/coding-agent run build
+```
+
+`build:native` produces the local Rust/N-API addon. The CLI build generates its required UI assets and writes `packages/coding-agent/dist/omp`. These commands deliberately avoid `bun setup`, which also links the development CLI into the global command path.
+
+### Run the patch tests
+
+After the build, run from the same patched OMP checkout root:
+
+```sh
+bun --cwd=packages/coding-agent run check:types
+bun --cwd=packages/coding-agent test \
+  test/live/controller.test.ts \
+  test/live/doubao-protocol.test.ts \
+  test/live/doubao-transport.test.ts \
+  test/live/protocol.test.ts \
+  test/rpc-live.test.ts \
+  test/modes/controllers/live-command-controller.test.ts \
+  test/config/settings-registry.test.ts
+```
+
+The patch includes protocol, transcript, delegation, and transport lifecycle regression tests, and updates existing live RPC tests. This targeted suite uses synthetic credentials and substituted audio/network boundaries; it does not require a real API key or open a microphone. It is not a live service or audio-device verification.
+
+### Put the runtime where the plugin can find it
+
+For an initial installation, run from the patched OMP checkout root:
+
+```sh
+mkdir -p "$HOME/.local/share/carly-switch"
+install -m 755 packages/coding-agent/dist/omp "$HOME/.local/share/carly-switch/omp"
+"$HOME/.local/share/carly-switch/omp" --version
+```
+
+Alternatively, keep the built executable elsewhere and set `CARLY_SWITCH_OMP` to its absolute path or a `~/` path before starting Tern. The variable must reach the process running the plugin; exporting it only inside an already-running pane is not sufficient. Stop voice sessions and use **Restore official OMP** before replacing an active custom runtime. Placing the executable does not switch the official launcher by itself; use **Save and apply** in the plugin when ready.
 
 ## Use
 

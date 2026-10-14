@@ -1,5 +1,5 @@
-# Source-only release: binaries, credentials, local state, archives, patches,
-# verification output, and other generated files are excluded by default.
+# Track only plugin sources, documentation, and the reviewed native patch.
+# Binaries, credentials, archives, local state, and generated output stay excluded.
 /*
 !/.gitignore
 !/README.md
@@ -9,3 +9,6 @@
 !/window.luau
 !/panel.css
 !/helper.mjs
+!/patches/
+/patches/*
+!/patches/omp-native-doubao.patch
