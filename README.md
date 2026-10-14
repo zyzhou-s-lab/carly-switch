@@ -5,7 +5,7 @@ Switch Carly's native realtime voice between Doubao and OpenAI from a compact [T
 Install on the Mac running Tern:
 
 ```sh
-tern plugin install github.com/cangiolo/carly-switch
+tern plugin install github.com/zyzhou-s-lab/carly-switch
 ```
 
 The repository is currently private, so installation requires GitHub access to it.
@@ -50,7 +50,7 @@ This repository includes `patches/omp-native-doubao.patch`, targeting [OMP v18.1
 The example uses sibling `carly-switch` and `omp-v18.10.3` checkouts. If you already have this repository, use its existing path instead of cloning it again.
 
 ```sh
-git clone https://github.com/cangiolo/carly-switch.git
+git clone https://github.com/zyzhou-s-lab/carly-switch.git
 git clone --branch v18.10.3 --depth 1 https://github.com/can1357/oh-my-pi.git omp-v18.10.3
 cd omp-v18.10.3
 git apply --check ../carly-switch/patches/omp-native-doubao.patch
