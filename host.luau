@@ -140,11 +140,17 @@ local function bun_path(): string
 	return "bun"
 end
 
--- Longer than every runtime-build stage cap combined, plus activation margin
--- (runtime-build.mjs SWITCH_TIMEOUT_MS). Stage caps fail and roll back before
--- the configuration transaction. This only stops a helper that itself stopped
--- making progress. Never terminate a configuration transaction halfway through rollback.
-local SWITCH_TIMEOUT_MS = 4 * 60 * 60 * 1000
+-- The switch cap is status.switchTimeoutMs, reported by the helper from
+-- runtime-build.mjs SWITCH_TIMEOUT_MS. There is no second literal here.
+-- Stage caps fail and roll back before the configuration transaction. This
+-- only stops a helper that itself stopped making progress. Never terminate a
+-- configuration transaction halfway through rollback.
+local function positive_timeout(value: any): number?
+	if type(value) ~= "number" or value <= 0 or value >= math.huge or value ~= math.floor(value) then
+		return nil
+	end
+	return value
+end
 local polling: { [number]: State } = {}
 
 local function valid_build(value: any): boolean
@@ -223,6 +229,14 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 		state.error = "This plugin requires macOS."
 		return
 	end
+	local cap = nil
+	if action == "switch" then
+		cap = positive_timeout(if state.status then state.status.switchTimeoutMs else nil)
+		if cap == nil then
+			state.error = "Unable to read the build time limit. Refresh the status."
+			return
+		end
+	end
 	state.busy = action
 	state.requestId += 1
 	local requestId = state.requestId
@@ -238,7 +252,7 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 		end
 		-- Never terminate a configuration transaction halfway through rollback.
 		-- Switch uses the long backstop above; restore is left to finish.
-		local timeout_ms = if action == "status" or action == "check" then 60000 elseif action == "switch" then SWITCH_TIMEOUT_MS else nil
+		local timeout_ms = if action == "status" or action == "check" then 60000 elseif action == "switch" then cap else nil
 		tern.process.run(argv, {
 			cwd = "/",
 			stdin = if doubao and state.apiKey ~= "" then state.apiKey else nil,
@@ -257,7 +271,8 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 				or type(reply.hasKeyFile) ~= "boolean" or type(reply.restartRequired) ~= "boolean"
 				or type(reply.keyFile) ~= "string" or type(reply.voice) ~= "string"
 				or type(reply.entry) ~= "string" or type(reply.message) ~= "string"
-				or type(reply.version) ~= "string" or reply.version == "" then
+				or type(reply.version) ~= "string" or reply.version == ""
+				or positive_timeout(reply.switchTimeoutMs) == nil then
 				state.status = nil
 				state.error = if result.timed_out then "Operation timed out. Refresh the status." else "Unable to read status. Check Bun and the plugin, then refresh."
 				-- Unexpected stdout/stderr must never be echoed: it may contain secrets.

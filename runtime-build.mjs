@@ -9,10 +9,12 @@ export const VERSION = '18.10.3';
 export const COMMIT = '81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b';
 const REPOSITORY = 'https://github.com/can1357/oh-my-pi.git';
 
-// Cold-path commands, in order: version; git --version; clone; rev-parse;
-// apply --check; apply; bun install; xcrun; rustup; build:native; bun run build;
-// smoke --version plus four config set/get pairs. The panel backstop must outlast
-// that sum so a slow compile is not killed during activation.
+// Worst-case commands, in order: version; warm-addon load; git --version;
+// clone; rev-parse; apply --check; apply; bun install; xcrun; rustup;
+// build:native; bun run build; smoke --version plus four config set/get pairs.
+// A hanging warm addon is tried before the cold compile, so its cap is part of
+// the sum. The panel backstop must outlast that sum so a slow compile is not
+// killed during activation.
 export const LIMITS = Object.freeze({
   version: 30,
   probe: 60,
@@ -25,6 +27,7 @@ export const LIMITS = Object.freeze({
   addon: 30,
 });
 export const COLD_BUILD_SECONDS = LIMITS.version
+  + LIMITS.addon
   + (LIMITS.probe * 5)
   + LIMITS.clone
   + LIMITS.dependencies

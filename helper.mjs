@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { YAML } from 'bun';
 import { fileURLToPath } from 'node:url';
-import { readBuild, runtimeManager, VERSION } from './runtime-build.mjs';
+import { readBuild, runtimeManager, SWITCH_TIMEOUT_MS, VERSION } from './runtime-build.mjs';
 
 // No key contents, child output, server payloads, or raw exceptions are logged.
 const HOME = homedir();
@@ -227,7 +227,7 @@ async function snapshot(action) {
     if (error) error = `${error} ${RUNTIME_HELP}`;
     else message = `${message} ${RUNTIME_HELP}`;
   }
-  return { ok: !error, action, version: VERSION, provider, installed, customBinaryExists, canAutoBuild, build: await readBuild(DATA), keyFile, voice,
+  return { ok: !error, action, version: VERSION, switchTimeoutMs: SWITCH_TIMEOUT_MS, provider, installed, customBinaryExists, canAutoBuild, build: await readBuild(DATA), keyFile, voice,
     hasKeyFile: await keyExists(keyFile), entry: ENTRY, originalTarget: state?.originalTarget ?? null,
     restartRequired: installed || !!state?.pending, message: error ?? message, ...(error ? { error } : {}) };
 }
@@ -535,7 +535,7 @@ try {
   assertScope();
   let inputKey = opts.keyStdin ? await readStdinKey() : undefined;
   if (action === 'help' || action === 'build-status') {
-    result = { ok: true, action, version: VERSION, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM), canAutoBuild, build: await readBuild(DATA),
+    result = { ok: true, action, version: VERSION, switchTimeoutMs: SWITCH_TIMEOUT_MS, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM), canAutoBuild, build: await readBuild(DATA),
       keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
       originalTarget: null, restartRequired: false, message: action === 'help' ? HELP : 'Runtime build progress retrieved.' };
   } else if (action === 'switch' || action === 'restore') result = await mutate(opts, inputKey);
@@ -554,7 +554,7 @@ try {
   try { result = await snapshot(action); } catch {}
   result = { ok: false, action, provider: 'codex', installed: false, customBinaryExists: false, canAutoBuild, build: await readBuild(DATA),
     keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
-    originalTarget: null, restartRequired: false, version: VERSION, ...result, ok: false, action, message, error: message };
+    originalTarget: null, restartRequired: false, ...result, ok: false, action, version: VERSION, switchTimeoutMs: SWITCH_TIMEOUT_MS, message, error: message };
 }
 process.stdout.write(`${JSON.stringify(result)}\n`);
 process.exitCode = result.ok ? 0 : 1;

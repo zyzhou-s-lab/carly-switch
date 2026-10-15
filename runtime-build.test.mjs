@@ -104,11 +104,20 @@ test('stage caps outlast a cold build and stay at least as generous as the revie
     toolchain: 30 * 60, native: 60 * 60, compile: 30 * 60, addon: 30,
   });
   expect(COLD_BUILD_SECONDS).toBe(
-    LIMITS.version + (LIMITS.probe * 5) + LIMITS.clone + LIMITS.dependencies
+    LIMITS.version + LIMITS.addon + (LIMITS.probe * 5) + LIMITS.clone + LIMITS.dependencies
     + LIMITS.toolchain + LIMITS.native + LIMITS.compile + (LIMITS.smoke * 9),
   );
   expect(SWITCH_TIMEOUT_MS).toBe(4 * 60 * 60 * 1000);
   expect(SWITCH_TIMEOUT_MS).toBeGreaterThan((COLD_BUILD_SECONDS + 15 * 60) * 1000);
+});
+
+test('the panel switch cap is only the helper-reported SWITCH_TIMEOUT_MS', async () => {
+  const host = await Bun.file(new URL('./host.luau', import.meta.url)).text();
+  const helper = await Bun.file(new URL('./helper.mjs', import.meta.url)).text();
+  expect(host).not.toMatch(/SWITCH_TIMEOUT_MS\s*=/);
+  expect(host).not.toContain(`${SWITCH_TIMEOUT_MS}`);
+  expect(host).toContain('state.status.switchTimeoutMs');
+  expect(helper).toContain('switchTimeoutMs: SWITCH_TIMEOUT_MS');
 });
 
 test('readBuild accepts a private progress record and rejects unsafe or malformed ones', async () => {
@@ -367,7 +376,7 @@ test.serial('prepare reuses a matching runtime and does not fetch source', async
   } finally { await fixture.cleanup(); }
 }, 20000);
 
-test.serial('a cache miss fails before clone when git cannot start the fetch', async () => {
+test.serial.skipIf(process.platform !== 'darwin')('a cache miss fails before clone when git cannot start the fetch', async () => {
   const fixture = await makeHome();
   try {
     await writeFakeOmp(fixture.runtime);
@@ -384,7 +393,7 @@ test.serial('a cache miss fails before clone when git cannot start the fetch', a
   } finally { await fixture.cleanup(); }
 }, 20000);
 
-test.serial('a stalled prerequisite times out into the failed build record', async () => {
+test.serial.skipIf(process.platform !== 'darwin')('a stalled prerequisite times out into the failed build record', async () => {
   const fixture = await makeHome();
   try {
     await writeFakeOmp(fixture.runtime);
