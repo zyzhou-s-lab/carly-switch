@@ -20,7 +20,10 @@ export const LIMITS = Object.freeze({
   probe: 60,
   smoke: 30,
   clone: 15 * 60,
-  dependencies: 15 * 60,
+  // A clean macOS install was still running when 15 minutes killed it, before
+  // rustup or the native compile started. 60 minutes still fails a hung
+  // install and stays inside the 4-hour panel backstop.
+  dependencies: 60 * 60,
   toolchain: 30 * 60,
   native: 60 * 60,
   compile: 30 * 60,
