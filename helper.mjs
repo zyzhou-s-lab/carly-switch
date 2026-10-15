@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { YAML } from 'bun';
 import { fileURLToPath } from 'node:url';
-import { readBuild, runtimeManager } from './runtime-build.mjs';
+import { readBuild, runtimeManager, VERSION } from './runtime-build.mjs';
 
 // No key contents, child output, server payloads, or raw exceptions are logged.
 const HOME = homedir();
@@ -24,11 +24,11 @@ const MAX_KEY_BYTES = 16 * 1024;
 // Provider is written last, including during rollback and restore.
 const KEYS = ['live.doubao.apiKeyFile', 'live.doubao.voice', 'live.provider'];
 const RUNTIME_HELP = canAutoBuild
-  ? 'The first Save/apply builds the pinned compatible OMP v18.10.3 runtime. Opening this panel does not build or change files.'
+  ? `The first Save/apply builds the pinned compatible OMP v${VERSION} runtime. Opening this panel does not build or change files.`
   : 'The explicitly selected CARLY_SWITCH_OMP runtime is missing or not executable. Supply a compatible runtime; explicit overrides are never built or overwritten.';
 const HELP = `Carly Switch (macOS only; default ~/.omp/agent global configuration)
 Usage: bun helper.mjs status|build-status|switch|restore|check [--provider codex|doubao] [--key-stdin] [--voice VOICE_ID]
-Runtime: first Save/apply builds pinned OMP v18.10.3 with the shipped patch at ~/.local/share/carly-switch/omp. Official Tern OMP must be exactly v18.10.3. Requires Bun >=1.4, Git and codesign; a cold native build also requires Cargo/Rustup, CMake and Xcode Command Line Tools. CARLY_SWITCH_OMP is a manual compatible-runtime override and is never overwritten.
+Runtime: first Save/apply builds pinned OMP v${VERSION} with the shipped patch at ~/.local/share/carly-switch/omp. Official Tern OMP must be exactly v${VERSION}. Each build stage has a time limit and fails closed before settings change. Requires Bun >=1.4, Git and codesign; a cold native build also requires Cargo/Rustup, CMake and Xcode Command Line Tools. CARLY_SWITCH_OMP is a manual compatible-runtime override and is never overwritten.
 status: read-only; does not execute OMP or read key contents.
 build-status: read-only progress metadata; never executes OMP. Private logs contain only controlled stage and command-exit summaries, not raw child output.
 switch --provider doubao: save and apply Doubao voice settings; first takeover backs up the original entry and three live fields.
@@ -227,7 +227,7 @@ async function snapshot(action) {
     if (error) error = `${error} ${RUNTIME_HELP}`;
     else message = `${message} ${RUNTIME_HELP}`;
   }
-  return { ok: !error, action, provider, installed, customBinaryExists, canAutoBuild, build: await readBuild(DATA), keyFile, voice,
+  return { ok: !error, action, version: VERSION, provider, installed, customBinaryExists, canAutoBuild, build: await readBuild(DATA), keyFile, voice,
     hasKeyFile: await keyExists(keyFile), entry: ENTRY, originalTarget: state?.originalTarget ?? null,
     restartRequired: installed || !!state?.pending, message: error ?? message, ...(error ? { error } : {}) };
 }
@@ -535,7 +535,7 @@ try {
   assertScope();
   let inputKey = opts.keyStdin ? await readStdinKey() : undefined;
   if (action === 'help' || action === 'build-status') {
-    result = { ok: true, action, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM), canAutoBuild, build: await readBuild(DATA),
+    result = { ok: true, action, version: VERSION, provider: 'codex', installed: false, customBinaryExists: await executable(CUSTOM), canAutoBuild, build: await readBuild(DATA),
       keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
       originalTarget: null, restartRequired: false, message: action === 'help' ? HELP : 'Runtime build progress retrieved.' };
   } else if (action === 'switch' || action === 'restore') result = await mutate(opts, inputKey);
@@ -554,7 +554,7 @@ try {
   try { result = await snapshot(action); } catch {}
   result = { ok: false, action, provider: 'codex', installed: false, customBinaryExists: false, canAutoBuild, build: await readBuild(DATA),
     keyFile: '', voice: DEFAULT_VOICE, hasKeyFile: false, entry: ENTRY,
-    originalTarget: null, restartRequired: false, ...result, ok: false, action, message, error: message };
+    originalTarget: null, restartRequired: false, version: VERSION, ...result, ok: false, action, message, error: message };
 }
 process.stdout.write(`${JSON.stringify(result)}\n`);
 process.exitCode = result.ok ? 0 : 1;

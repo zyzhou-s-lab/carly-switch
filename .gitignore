@@ -10,6 +10,7 @@
 !/panel.css
 !/helper.mjs
 !/runtime-build.mjs
+!/runtime-build.test.mjs
 !/patches/
 /patches/*
 !/patches/omp-native-doubao.patch

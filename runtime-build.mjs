@@ -1,15 +1,46 @@
 import { constants } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { access, chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, dirname, basename } from 'node:path';
 
-const VERSION = '18.10.3';
-const COMMIT = '81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b';
+// Single source for the pinned OMP release. User-facing copy derives from this.
+export const VERSION = '18.10.3';
+export const COMMIT = '81e1d8927a3c16cfaff2e9456baa8c060e1e0e9b';
 const REPOSITORY = 'https://github.com/can1357/oh-my-pi.git';
+
+// Cold-path commands, in order: version; git --version; clone; rev-parse;
+// apply --check; apply; bun install; xcrun; rustup; build:native; bun run build;
+// smoke --version plus four config set/get pairs. The panel backstop must outlast
+// that sum so a slow compile is not killed during activation.
+export const LIMITS = Object.freeze({
+  version: 30,
+  probe: 60,
+  smoke: 30,
+  clone: 15 * 60,
+  dependencies: 15 * 60,
+  toolchain: 30 * 60,
+  native: 60 * 60,
+  compile: 30 * 60,
+  addon: 30,
+});
+export const COLD_BUILD_SECONDS = LIMITS.version
+  + (LIMITS.probe * 5)
+  + LIMITS.clone
+  + LIMITS.dependencies
+  + LIMITS.toolchain
+  + LIMITS.native
+  + LIMITS.compile
+  + (LIMITS.smoke * 9);
+export const SWITCH_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+if (SWITCH_TIMEOUT_MS <= (COLD_BUILD_SECONDS + 15 * 60) * 1000) {
+  throw new Error('Switch timeout does not cover a cold build');
+}
+
 const MESSAGES = {
   version: 'Checking the official OMP version.',
   prerequisites: 'Checking local build prerequisites.',
-  source: 'Fetching pinned OMP v18.10.3 source.',
+  source: `Fetching pinned OMP v${VERSION} source.`,
   patch: 'Applying the shipped Doubao patch.',
   dependencies: 'Installing locked build dependencies.',
   native: 'Preparing the version-matched native addon.',
@@ -36,6 +67,136 @@ async function fingerprint(path) {
   if (!value.isFile() || value.uid !== process.getuid()) throw new Error('Unsafe runtime file');
   return digest(await readFile(path));
 }
+
+// Explicit safety check: absence is allowed, anything that is not a
+// user-owned regular file throws. Callers that only need the throw can
+// ignore the returned hash.
+export async function assertSafe(path) {
+  try {
+    return await fingerprint(path);
+  } catch (error) {
+    if (error?.message === 'Unsafe runtime file') {
+      throw new BuildError('The runtime manifest is not a private regular file owned by the current user.');
+    }
+    throw error;
+  }
+}
+
+export function cacheMatches(cached, base, binarySHA256) {
+  if (!cached || typeof cached !== 'object' || Array.isArray(cached)) return false;
+  return Object.entries(base).every(([key, value]) => cached[key] === value) && cached.binarySHA256 === binarySHA256;
+}
+
+export function rustChannel(text) {
+  let inToolchain = false;
+  let channel;
+  for (const raw of String(text).split(/\r?\n/u)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const header = line.match(/^\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$/u);
+    if (header) {
+      inToolchain = header[1] === 'toolchain';
+      continue;
+    }
+    if (!inToolchain) continue;
+    const match = line.match(/^channel\s*=\s*(?:"([^"\n]+)"|'([^'\n]+)'|([A-Za-z0-9._+-]+))\s*(?:#.*)?$/u);
+    if (match) channel = match[1] ?? match[2] ?? match[3];
+  }
+  if (!channel || !/^[A-Za-z0-9._+-]{1,80}$/u.test(channel)) {
+    throw new BuildError('The pinned source rust-toolchain.toml does not name a usable channel.');
+  }
+  return channel;
+}
+
+export async function readRustChannel(source) {
+  const path = join(source, 'rust-toolchain.toml');
+  const value = await info(path);
+  if (!value?.isFile()) throw new BuildError('The pinned source is missing rust-toolchain.toml.');
+  return rustChannel(await readFile(path, 'utf8'));
+}
+
+function killGroup(child) {
+  const pid = child.pid;
+  if (!pid) return;
+  try { process.kill(-pid, 'SIGKILL'); }
+  catch { try { child.kill('SIGKILL'); } catch {} }
+}
+
+// `seconds` is required. A missing limit is a programming error, not an
+// unbounded build. The child is a process-group leader so a timeout also
+// stops compilers it spawned.
+export async function runCommand(args, { cwd = '/', env = process.env, seconds, capture = false } = {}) {
+  if (!Number.isInteger(seconds) || seconds <= 0) throw new Error('Build command has no time limit');
+  let child;
+  try {
+    child = spawn(args[0], args.slice(1), { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    throw new Error('Cannot start build command');
+  }
+  let timedOut = false;
+  let settled = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killGroup(child);
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }, seconds * 1000);
+  async function drain(stream, keep) {
+    if (!stream) return '';
+    const chunks = [];
+    let size = 0;
+    try {
+      for await (const bytes of stream) {
+        if (keep && size < 64 * 1024) {
+          const part = bytes.subarray(0, 64 * 1024 - size);
+          chunks.push(part);
+          size += part.length;
+        }
+      }
+    } catch { /* The timeout path closes the pipes. */ }
+    return keep ? Buffer.concat(chunks).toString('utf8').trim() : '';
+  }
+  try {
+    const exited = new Promise((resolve, reject) => {
+      child.once('error', () => {
+        if (settled) return;
+        settled = true;
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        reject(new Error('Cannot start build command'));
+      });
+      child.once('exit', status => {
+        settled = true;
+        resolve(status ?? 1);
+      });
+    });
+    const [code, output] = await Promise.all([exited, drain(child.stdout, capture), drain(child.stderr, false)]);
+    return { code, output, timedOut };
+  } finally { clearTimeout(timer); }
+}
+
+// Reuse a same-user native addon only after its stamp and load check.
+// There is no separate signature; the SHA-256 is the provenance we record.
+// Returns null when the addon cannot be reused.
+export async function reuseWarmNative({ warm, native, command, append = async () => {}, seconds = LIMITS.addon }) {
+  const warmInfo = await info(warm);
+  if (!warmInfo?.isFile() || warmInfo.uid !== process.getuid()) return null;
+  const bytes = await readFile(warm);
+  if (!bytes.includes(Buffer.from(`PI_NATIVES_VERSION_STAMP:${VERSION}\0`))) return null;
+  await copyFile(warm, native, constants.COPYFILE_EXCL);
+  if (digest(await readFile(native)) !== digest(bytes)) throw new Error('Native addon changed while copying');
+  const sha256 = digest(bytes);
+  await append(`Considering native addon SHA-256 ${sha256}.`);
+  const script = `const m={exports:{}};process.dlopen(m,process.argv[1]);if(m.exports.__piNativesBuildVersion()!==${JSON.stringify(VERSION)})process.exit(1);`;
+  const loaded = await command([process.execPath, '-e', script, native], '/', { seconds, allowFailure: true });
+  if (loaded === null) {
+    await unlink(native);
+    return null;
+  }
+  await append(`Reused native addon SHA-256 ${sha256}.`);
+  return sha256;
+}
+
 async function privateDirectory(path, home, create = true) {
   let current = home;
   const base = await lstat(home);
@@ -74,6 +235,10 @@ function isolatedEnvironment(home, temporary) {
   };
 }
 
+/**
+ * Private build progress from `build.json`, or null when the record is missing
+ * or fails the ownership, mode, stage, state, or log-name checks.
+ */
 export async function readBuild(data) {
   try {
     const path = join(data, 'build.json');
@@ -88,7 +253,19 @@ export async function readBuild(data) {
   } catch { return null; }
 }
 
-export function runtimeManager({ home, data, runtime, patch, fail }) {
+/**
+ * One switch/restore build lifecycle.
+ * Call `validateOfficial` before `prepare`: it checks the pinned version and
+ * opens the private log and staging directory. `pending` reloads an
+ * interrupted install journal. `prepare` reuses a cache hit or builds a
+ * candidate and writes the journal; it does not change the live entry.
+ * `install` publishes that candidate, `rollback` restores the previous
+ * runtime, and `finalize` retires the journal only after the helper commits
+ * settings. `failed` and `close` record the outcome and drop staging that is
+ * not retained for recovery. Command timeouts apply inside `prepare`, before
+ * that journal is installed; `install` and `rollback` are not timer-killed.
+ */
+export function runtimeManager({ home, data, runtime, patch, fail, limits = LIMITS }) {
   const root = dirname(runtime);
   const manifestPath = join(root, 'manifest.json');
   const journalPath = join(root, 'runtime-transaction.json');
@@ -122,27 +299,18 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
     await append(`${state}: ${MESSAGES[name]}`);
     process.stderr.write(`[carly-switch] ${MESSAGES[name]} Log: ${join(data, progress.logName)}\n`);
   }
-  async function command(args, cwd, { capture = false, seconds = 0, allowFailure = false } = {}) {
-    let child;
-    try { child = Bun.spawn(args, { cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' }); }
-    catch { throw new Error('Cannot start build command'); }
-    let timedOut = false;
-    const timer = seconds ? setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, seconds * 1000) : undefined;
-    async function drain(stream, keep) {
-      const chunks = []; let size = 0;
-      for await (const bytes of stream) {
-        if (keep && size < 64 * 1024) { const part = bytes.subarray(0, 64 * 1024 - size); chunks.push(part); size += part.length; }
-      }
-      return keep ? Buffer.concat(chunks).toString('utf8').trim() : '';
+  async function command(args, cwd, { capture = false, seconds, allowFailure = false } = {}) {
+    if (!env) throw new Error('Build environment is not initialized');
+    const result = await runCommand(args, { cwd, env, seconds, capture });
+    const name = args[0] === process.execPath ? 'bun' : basename(String(args[0] ?? ''));
+    const executableName = /^[A-Za-z0-9._-]{1,80}$/u.test(name) ? name : 'executable';
+    await append(`Command ${executableName} completed in ${currentStage}: exit ${result.code}${result.timedOut ? ' (timeout)' : ''}.`);
+    if (result.timedOut || result.code !== 0) {
+      if (allowFailure) return null;
+      if (result.timedOut) throw new BuildError(`The ${currentStage} stage exceeded its time limit.`);
+      throw new Error('Build command failed');
     }
-    try {
-      const [code, output] = await Promise.all([child.exited, drain(child.stdout, capture), drain(child.stderr, false)]);
-      const name = args[0] === process.execPath ? 'bun' : basename(args[0]);
-      const executableName = /^[A-Za-z0-9._-]{1,80}$/u.test(name) ? name : 'executable';
-      await append(`Command ${executableName} completed in ${currentStage}: exit ${code}${timedOut ? ' (timeout)' : ''}.`);
-      if (code !== 0 || timedOut) { if (allowFailure) return null; throw new Error('Build command failed'); }
-      return output;
-    } finally { clearTimeout(timer); }
+    return result.output;
   }
   function errorMessage() {
     return `Runtime preparation failed during ${currentStage}. No raw child output is displayed.${progress ? ` Private build log: ${join(data, progress.logName)}.` : ''}`;
@@ -168,11 +336,11 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
   }
   async function smoke(path) {
     await stage('smoke');
-    const version = await command([path, '--version'], '/', { capture: true, seconds: 30 });
-    if (version !== `omp/${VERSION}`) throw new BuildError('The candidate does not report exactly omp/18.10.3.');
+    const version = await command([path, '--version'], '/', { capture: true, seconds: limits.version });
+    if (version !== `omp/${VERSION}`) throw new BuildError(`The candidate does not report exactly omp/${VERSION}.`);
     for (const [key, value] of [['live.provider', 'doubao'], ['live.doubao.apiKeyFile', join(workspace, 'unused-key')], ['live.doubao.voice', 'zh_female_vv_jupiter_bigtts'], ['live.provider', 'codex']]) {
-      await command([path, 'config', 'set', key, value, '--json'], '/', { seconds: 30 });
-      const output = await command([path, 'config', 'get', key, '--json'], '/', { capture: true, seconds: 30 });
+      await command([path, 'config', 'set', key, value, '--json'], '/', { seconds: limits.smoke });
+      const output = await command([path, 'config', 'get', key, '--json'], '/', { capture: true, seconds: limits.smoke });
       const parsed = JSON.parse(output);
       if (parsed.value !== value) throw new Error('Candidate setting mismatch');
     }
@@ -256,6 +424,11 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
       },
     };
   }
+  function recoveryRecordValid(record) {
+    return record?.version === 1 && /^\.build-[A-Za-z0-9]+$/u.test(record.directory) &&
+      [record.beforeBinary, record.beforeManifest, record.afterBinary, record.afterManifest].every(validHash) &&
+      !!record.afterBinary && !!record.afterManifest && digest(`${JSON.stringify(record.manifest)}\n`) === record.afterManifest;
+  }
   return {
     async pending(committedId) {
       const value = await info(journalPath);
@@ -265,9 +438,7 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
       if (!value.isFile() || value.uid !== process.getuid() || value.mode & 0o077) fail('Unsafe runtime recovery record; refusing changes.');
       let record;
       try { record = JSON.parse(await readFile(journalPath, 'utf8')); } catch { fail('Unreadable runtime recovery record; refusing changes.'); }
-      if (record?.version !== 1 || !/^\.build-[A-Za-z0-9]+$/u.test(record.directory) ||
-          ![record.beforeBinary, record.beforeManifest, record.afterBinary, record.afterManifest].every(validHash) ||
-          !record.afterBinary || !record.afterManifest || digest(`${JSON.stringify(record.manifest)}\n`) !== record.afterManifest) fail('Invalid runtime recovery record; refusing changes.');
+      if (!recoveryRecordValid(record)) fail('Invalid runtime recovery record; refusing changes.');
       // A committed activation no longer depends on candidate or backup files.
       if (record.directory === committedId) return transaction(record);
       const directory = join(root, record.directory);
@@ -281,17 +452,18 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
       await guarded(async () => {
         await initialize();
         await stage('version');
-        const version = await command([path, '--version'], '/', { capture: true, seconds: 30 });
-        if (version !== `omp/${VERSION}`) throw new BuildError('Only official OMP 18.10.3 is supported; the detected version is not an exact match. No runtime, settings, or entry was changed.');
+        const version = await command([path, '--version'], '/', { capture: true, seconds: limits.version });
+        if (version !== `omp/${VERSION}`) throw new BuildError(`Only official OMP ${VERSION} is supported; the detected version is not an exact match. No runtime, settings, or entry was changed.`);
       });
     },
     async prepare() {
       return guarded(async () => {
         const base = { version: VERSION, commit: COMMIT, patchSHA256: digest(await readFile(patch)), platform: process.platform, arch: process.arch };
         let cached;
-        await fingerprint(manifestPath);
+        // Throw if manifest.json exists but is not a user-owned regular file.
+        await assertSafe(manifestPath);
         try { cached = JSON.parse(await readFile(manifestPath, 'utf8')); } catch {}
-        if (cached && Object.entries(base).every(([key, value]) => cached[key] === value) && cached.binarySHA256 === await fingerprint(runtime)) {
+        if (cacheMatches(cached, base, await fingerprint(runtime))) {
           await access(runtime, constants.X_OK);
           await stage('cache');
           await smoke(runtime);
@@ -304,50 +476,43 @@ export function runtimeManager({ home, data, runtime, patch, fail }) {
         if (major < 1 || (major === 1 && minor < 4)) throw new BuildError('Install Bun 1.4 or newer before building.');
         if (process.platform !== 'darwin' || !['arm64', 'x64'].includes(process.arch)) throw new BuildError('This build supports macOS arm64 and x64 only.');
         for (const tool of ['git', 'codesign']) if (!Bun.which(tool)) throw new BuildError(`Required build tool is missing: ${tool}.`);
-        await command(['git', '--version'], '/');
+        await command(['git', '--version'], '/', { seconds: limits.probe });
         await stage('source');
         const source = join(workspace, 'source');
-        await command(['git', '-c', 'credential.helper=', 'clone', '--depth', '1', '--branch', `v${VERSION}`, '--single-branch', REPOSITORY, source], '/');
-        if (await command(['git', 'rev-parse', 'HEAD'], source, { capture: true }) !== COMMIT) throw new BuildError('The fetched tag does not match the pinned source commit.');
+        await command(['git', '-c', 'credential.helper=', 'clone', '--depth', '1', '--branch', `v${VERSION}`, '--single-branch', REPOSITORY, source], '/', { seconds: limits.clone });
+        if (await command(['git', 'rev-parse', 'HEAD'], source, { capture: true, seconds: limits.probe }) !== COMMIT) throw new BuildError('The fetched tag does not match the pinned source commit.');
         await stage('patch');
-        await command(['git', 'apply', '--check', patch], source);
-        await command(['git', 'apply', patch], source);
+        await command(['git', 'apply', '--check', patch], source, { seconds: limits.probe });
+        await command(['git', 'apply', patch], source, { seconds: limits.probe });
         await stage('dependencies');
-        await command([process.execPath, 'install', '--frozen-lockfile', '--ignore-scripts'], source);
+        await command([process.execPath, 'install', '--frozen-lockfile', '--ignore-scripts'], source, { seconds: limits.dependencies });
         await stage('native');
         const nativeName = `pi_natives.darwin-${process.arch === 'arm64' ? 'arm64' : 'x64-baseline'}.node`;
         const native = join(source, 'packages', 'natives', 'native', nativeName);
         const warm = join(home, '.omp', 'natives', VERSION, nativeName);
-        let reusedNative = false;
-        const warmInfo = await info(warm);
-        if (warmInfo?.isFile() && warmInfo.uid === process.getuid()) {
-          const bytes = await readFile(warm);
-          if (bytes.includes(Buffer.from(`PI_NATIVES_VERSION_STAMP:${VERSION}\0`))) {
-            await copyFile(warm, native, constants.COPYFILE_EXCL);
-            const script = 'const m={exports:{}};process.dlopen(m,process.argv[1]);if(m.exports.__piNativesBuildVersion()!=="18.10.3")process.exit(1);';
-            reusedNative = await command([process.execPath, '-e', script, native], '/', { seconds: 30, allowFailure: true }) !== null;
-            if (!reusedNative) await unlink(native);
-          }
-        }
-        if (!reusedNative) {
+        let nativeSHA256 = await reuseWarmNative({ warm, native, command, append, seconds: limits.addon });
+        if (!nativeSHA256) {
           for (const tool of ['cargo', 'rustc', 'rustup', 'xcrun', 'clang', 'ar', 'ranlib', 'make', 'cmake']) {
             if (!Bun.which(tool)) throw new BuildError(`Required cold native build tool is missing: ${tool}.`);
           }
-          await command(['xcrun', '--find', 'clang'], '/');
+          await command(['xcrun', '--find', 'clang'], '/', { seconds: limits.probe });
           // Keep Cargo tokens/config and Rustup settings out of the build environment.
           env.CARGO_HOME = join(workspace, 'home', '.cargo');
           env.RUSTUP_HOME = join(workspace, 'home', '.rustup');
-          env.RUSTUP_TOOLCHAIN = 'nightly-2026-10-06';
-          await command(['rustup', 'toolchain', 'install', env.RUSTUP_TOOLCHAIN, '--profile', 'minimal'], '/');
-          await command([process.execPath, 'run', 'build:native'], source);
+          env.RUSTUP_TOOLCHAIN = await readRustChannel(source);
+          await append(`Using Rust toolchain ${env.RUSTUP_TOOLCHAIN} from rust-toolchain.toml.`);
+          await command(['rustup', 'toolchain', 'install', env.RUSTUP_TOOLCHAIN, '--profile', 'minimal'], '/', { seconds: limits.toolchain });
+          await command([process.execPath, 'run', 'build:native'], source, { seconds: limits.native });
+          nativeSHA256 = digest(await readFile(native));
+          await append(`Built native addon SHA-256 ${nativeSHA256}.`);
         }
         await stage('compile');
-        await command([process.execPath, 'run', 'build'], join(source, 'packages', 'coding-agent'));
+        await command([process.execPath, 'run', 'build'], join(source, 'packages', 'coding-agent'), { seconds: limits.compile });
         const candidate = join(workspace, 'candidate');
         await copyFile(join(source, 'packages', 'coding-agent', 'dist', 'omp'), candidate, constants.COPYFILE_EXCL);
         await chmod(candidate, 0o700);
         await smoke(candidate);
-        const manifest = { ...base, binarySHA256: await fingerprint(candidate) };
+        const manifest = { ...base, binarySHA256: await fingerprint(candidate), nativeSHA256 };
         const beforeBinary = await fingerprint(runtime);
         const beforeManifest = await fingerprint(manifestPath);
         if (beforeBinary !== null) await copyFile(runtime, join(workspace, 'previous-omp'), constants.COPYFILE_EXCL);

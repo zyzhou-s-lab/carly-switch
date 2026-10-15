@@ -140,6 +140,11 @@ local function bun_path(): string
 	return "bun"
 end
 
+-- Longer than every runtime-build stage cap combined, plus activation margin
+-- (runtime-build.mjs SWITCH_TIMEOUT_MS). Stage caps fail and roll back before
+-- the configuration transaction. This only stops a helper that itself stopped
+-- making progress. Never terminate a configuration transaction halfway through rollback.
+local SWITCH_TIMEOUT_MS = 4 * 60 * 60 * 1000
 local polling: { [number]: State } = {}
 
 local function valid_build(value: any): boolean
@@ -232,10 +237,12 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 			if state.apiKey ~= "" then table.insert(argv, "--key-stdin") end
 		end
 		-- Never terminate a configuration transaction halfway through rollback.
+		-- Switch uses the long backstop above; restore is left to finish.
+		local timeout_ms = if action == "status" or action == "check" then 60000 elseif action == "switch" then SWITCH_TIMEOUT_MS else nil
 		tern.process.run(argv, {
 			cwd = "/",
 			stdin = if doubao and state.apiKey ~= "" then state.apiKey else nil,
-			timeout_ms = if action == "status" or action == "check" then 60000 else nil,
+			timeout_ms = timeout_ms,
 		}, function(result)
 			if state.disposed or state.requestId ~= requestId then return end
 			stop_polling(state, cx)
@@ -249,7 +256,8 @@ local function request(state: State, cx: BlockCx, action: string, provider: stri
 				or type(reply.canAutoBuild) ~= "boolean" or not valid_build(reply.build)
 				or type(reply.hasKeyFile) ~= "boolean" or type(reply.restartRequired) ~= "boolean"
 				or type(reply.keyFile) ~= "string" or type(reply.voice) ~= "string"
-				or type(reply.entry) ~= "string" or type(reply.message) ~= "string" then
+				or type(reply.entry) ~= "string" or type(reply.message) ~= "string"
+				or type(reply.version) ~= "string" or reply.version == "" then
 				state.status = nil
 				state.error = if result.timed_out then "Operation timed out. Refresh the status." else "Unable to read status. Check Bun and the plugin, then refresh."
 				-- Unexpected stdout/stderr must never be echoed: it may contain secrets.
@@ -326,7 +334,7 @@ local function confirmation(state: State): Node
 		key = "confirmation", modal = true, head = if restore then "Restore original runtime?" elseif build then "Build and enable Carly Switch?" else "Enable Carly Switch?",
 	}, {
 		ui.text(if restore then "Restore the original runtime and voice settings. Restart Tern to apply. The current call is unaffected."
-			elseif build then "Download the pinned omp 18.10.3 source, apply the shipped patch, and build a private runtime. This requires network access and build tools; only official omp 18.10.3 is supported. The official binary stays unchanged and the original entry point is backed up before enabling. Restart Tern after first enabling. This does not start the microphone or interrupt the current call."
+			elseif build then "Download the pinned omp " .. state.status.version .. " source, apply the shipped patch, and build a private runtime. This requires network access and build tools; only official omp " .. state.status.version .. " is supported. The official binary stays unchanged and the original entry point is backed up before enabling. Restart Tern after first enabling. This does not start the microphone or interrupt the current call."
 			else "Back up the original entry point and enable voice settings. Restart Tern after first enabling. This will not start the microphone or interrupt the current call."),
 		ui.row({ button(if restore then "Restore" elseif build then "Build and enable" else "Enable", "confirm", state.busy == "", "cs-button-primary"),
 			button("Cancel", "cancel", state.busy == "", nil) }),
@@ -386,7 +394,7 @@ local function view(state: State): BlockView
 	end
 	if status and not status.customBinaryExists and state.busy ~= "switch" then
 		if status.canAutoBuild then
-			table.insert(kids, ui.diagnostic({ severity = "note", message = "First Save downloads and builds a private omp 18.10.3 runtime with the shipped patch. Network access and build tools are required. Only official omp 18.10.3 is supported; the official binary is preserved." }))
+			table.insert(kids, ui.diagnostic({ severity = "note", message = "First Save downloads and builds a private omp " .. status.version .. " runtime with the shipped patch. Network access and build tools are required. Only official omp " .. status.version .. " is supported; the official binary is preserved." }))
 		else
 			table.insert(kids, ui.diagnostic({ severity = "error", message = "Configured runtime unavailable. CARLY_SWITCH_OMP is a manual override and is never built or overwritten automatically. Supply a compatible runtime at that path, or unset the override to build on first Save." }))
 		end
