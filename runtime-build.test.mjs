@@ -100,7 +100,7 @@ async function stageCandidate(root, directory, bytes) {
 
 test('stage caps outlast a cold build and stay at least as generous as the review', () => {
   expect(LIMITS).toEqual({
-    version: 30, probe: 60, smoke: 30, clone: 15 * 60, dependencies: 15 * 60,
+    version: 30, probe: 60, smoke: 30, clone: 15 * 60, dependencies: 60 * 60,
     toolchain: 30 * 60, native: 60 * 60, compile: 30 * 60, addon: 30,
   });
   expect(COLD_BUILD_SECONDS).toBe(
